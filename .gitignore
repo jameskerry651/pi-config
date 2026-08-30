@@ -1,0 +1,28 @@
+# ============================================================
+# pi config repo — ignore rules
+# Repo root is ~/.pi/agent (the live config dir).
+# Only portable config is tracked; secrets/runtime are excluded.
+# ============================================================
+
+# ❌ Secrets — NEVER commit
+# auth.json holds your provider API keys (DeepSeek, etc.). Keep it local.
+auth.json
+
+# Ephemeral runtime state (session history, logs) — huge & machine-specific
+sessions/
+bin/
+*.log
+
+# Dependencies — rebuilt via `npm install`.
+# node_modules/ matches at any depth (npm/node_modules, extensions/browser/node_modules)
+node_modules/
+
+# Browser extension profile — cookies, login state, cache
+extensions/browser/.profile/
+
+# Machine-specific: absolute local filesystem paths (not portable)
+trust.json
+
+# OS junk
+.DS_Store
+Thumbs.db

@@ -1,0 +1,5 @@
+# npm dir: ignore generated/transient content, but track the dependency manifest
+* 
+!.gitignore
+!package.json
+!package-lock.json
