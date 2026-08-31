@@ -4,8 +4,11 @@
   "defaultProvider": "deepseek",
   "defaultModel": "deepseek-v4-flash-vision-exp",
   "tuiMode": "regular",
+  "shellPath": "/Users/james/.pi/bin/zsh-wrapper",
   "packages": [
     "npm:@tintinweb/pi-subagents",
-    "npm:pi-web-access"
+    "npm:pi-web-access",
+    "npm:@sentiolabs/pi-frontend-design",
+    "npm:remote-pi"
   ]
 }
