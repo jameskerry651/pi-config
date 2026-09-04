@@ -1,6 +1,6 @@
 ---
 name: brainstorming
-description: "You MUST use this before any creative work - creating features, building components, adding functionality, or modifying behavior. Explores user intent, requirements and design before implementation."
+description: "仅供用户主动、明确要求头脑风暴时才调用（例如用户说\"头脑风暴\"、\"构思一个方案\"、\"帮我把这个想法打磨成设计\"）。不要自动触发。通过对话把想法打磨成完整的设计和规格。除非用户显式请求头脑风暴流程，否则不启动此 skill。"
 ---
 
 # Brainstorming Ideas Into Designs

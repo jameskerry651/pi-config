@@ -3,12 +3,11 @@
   "theme": "dark",
   "defaultProvider": "deepseek",
   "defaultModel": "deepseek-v4-flash-vision-exp",
-  "tuiMode": "regular",
+  "tuiMode": "fullscreen",
   "shellPath": "/Users/james/.pi/bin/zsh-wrapper",
   "packages": [
     "npm:@tintinweb/pi-subagents",
     "npm:pi-web-access",
-    "npm:@sentiolabs/pi-frontend-design",
-    "npm:remote-pi"
+    "npm:@sentiolabs/pi-frontend-design"
   ]
 }

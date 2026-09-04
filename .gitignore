@@ -23,6 +23,18 @@ extensions/browser/.profile/
 # Machine-specific: absolute local filesystem paths (not portable)
 trust.json
 
+# Machine-specific symlinks — point to personal projects at absolute paths
+# (dangle on another machine). Source lives in those projects, not here.
+extensions/pimail
+skills/training-monitor
+
+# Local runtime data for the pimail extension (mail account config + log)
+/pimail/
+
+# Bark deviceKey sits in config.json — keep it local, use PI_BARK_WATCH_KEY env on
+# each machine instead of committing a key.
+extensions/pi-bark-watch/config.json
+
 # OS junk
 .DS_Store
 Thumbs.db
