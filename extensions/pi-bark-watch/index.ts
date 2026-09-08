@@ -25,13 +25,31 @@
  *   sound       -> PI_BARK_WATCH_SOUND     default "minuet"
  *   level       -> PI_BARK_WATCH_LEVEL     optional "critical"|"active"|"timeSensitive"|"passive"
  *
+ * Also pushes when the AI blocks on a question (ask_user_question / any
+ * ctx.ui.* prompt -> ui_prompt_start):
+ *   notifyOnQuestion    -> PI_BARK_WATCH_QUESTION           default true
+ *   questionDelaySec    -> PI_BARK_WATCH_QUESTION_DELAY     default 3
+ *   questionCooldownSec -> PI_BARK_WATCH_QUESTION_COOLDOWN  default 30
+ *
  * Test with:  /bark-watch
+ *
+ * Subagent suppression: the Agent tool (from @tintinweb/pi-subagents) runs
+ * every subagent in-process as its own AgentSession that loads the user's
+ * global extensions — including this one. Each child session has its own
+ * event bus, so without a guard every finished subagent would push a
+ * notification. This extension stays quiet inside child sessions and only
+ * notifies from the top-level session (see isSubagentSession).
  */
 
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  CONFIG_DIR_NAME,
+  type ExtensionAPI,
+  type ExtensionContext,
+  type UIPromptKind,
+} from "@earendil-works/pi-coding-agent";
 
 interface BarkConfig {
   server: string;
@@ -39,12 +57,18 @@ interface BarkConfig {
   minutes: number;
   sound: string;
   level: "critical" | "active" | "timeSensitive" | "passive";
+  notifyOnQuestion: boolean;
+  questionDelaySec: number;
+  questionCooldownSec: number;
 }
 
 const DEFAULT_SERVER = "https://api.day.app";
 const DEFAULT_MINUTES = 3;
 const DEFAULT_SOUND = "minuet";
 const DEFAULT_LEVEL: BarkConfig["level"] = "active";
+const DEFAULT_NOTIFY_ON_QUESTION = true;
+const DEFAULT_QUESTION_DELAY_SEC = 3;
+const DEFAULT_QUESTION_COOLDOWN_SEC = 30;
 const BARK_REQUEST_TIMEOUT_MS = 10_000;
 const VALID_LEVELS = new Set<BarkConfig["level"]>([
   "critical",
@@ -58,6 +82,22 @@ function asString(value: unknown, fallback: string): string {
   return typeof value === "string" && value.trim().length > 0
     ? value.trim()
     : fallback;
+}
+
+function asBool(value: unknown, fallback: boolean): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const v = value.trim().toLowerCase();
+    if (["1", "true", "yes", "y", "on"].includes(v)) return true;
+    if (["0", "false", "no", "n", "off"].includes(v)) return false;
+  }
+  return fallback;
+}
+
+function asNonNegativeNumber(value: unknown, fallback: number): number {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
 function normalizeServer(value: unknown): string {
@@ -135,6 +175,18 @@ function loadConfig(): BarkConfig {
       DEFAULT_SOUND,
     ),
     level,
+    notifyOnQuestion: asBool(
+      process.env.PI_BARK_WATCH_QUESTION ?? file.notifyOnQuestion,
+      DEFAULT_NOTIFY_ON_QUESTION,
+    ),
+    questionDelaySec: asNonNegativeNumber(
+      process.env.PI_BARK_WATCH_QUESTION_DELAY ?? file.questionDelaySec,
+      DEFAULT_QUESTION_DELAY_SEC,
+    ),
+    questionCooldownSec: asNonNegativeNumber(
+      process.env.PI_BARK_WATCH_QUESTION_COOLDOWN ?? file.questionCooldownSec,
+      DEFAULT_QUESTION_COOLDOWN_SEC,
+    ),
   };
 }
 
@@ -146,6 +198,50 @@ function formatDuration(ms: number): string {
   const h = Math.floor(m / 60);
   if (h === 0) return m === 0 ? `${s}s` : `${m}m ${s}s`;
   return `${h}h ${m % 60}m`;
+}
+
+/**
+ * True when this extension instance is running inside a subagent child
+ * session (Agent tool, nested agent, or SubagentWorkflow child).
+ *
+ * Child sessions are created in-process by @tintinweb/pi-subagents and load
+ * the same global extensions, so each child gets its own copy of this
+ * extension and its own agent_settled events. Detection signals:
+ *
+ *   1. The session header carries a parentSession — persisted subagent
+ *      sessions (rememberAgents defaults to true) record their spawning
+ *      session as parent. Top-level interactive sessions never have one.
+ *   2. The session is in-memory (no session file) while the pi-subagents
+ *      manager registry exists in this process — nested and workflow
+ *      children are in-memory by default.
+ *
+ * On any introspection failure we assume a top-level session: a wrongly
+ * silenced notification is worse than a rare extra one.
+ */
+function isSubagentSession(
+  ctx: Pick<ExtensionContext, "sessionManager">,
+): boolean {
+  const sm = ctx.sessionManager;
+  if (!sm) return false;
+  try {
+    const header = sm.getHeader?.() ?? null;
+    if (
+      header &&
+      typeof header.parentSession === "string" &&
+      header.parentSession.length > 0
+    ) {
+      return true;
+    }
+    if (typeof sm.getSessionFile === "function" && !sm.getSessionFile()) {
+      const registry = (
+        globalThis as unknown as Record<symbol, unknown>
+      )[Symbol.for("pi-subagents:manager")];
+      return registry !== undefined;
+    }
+  } catch {
+    // ignore — fall through to "top-level"
+  }
+  return false;
 }
 
 /** POST a push to the Bark server. Resolves true on a 2xx response. */
@@ -201,10 +297,38 @@ async function sendBark(
   }
 }
 
+// Push + local-banner for the "AI is blocked waiting for the user" case.
+// Local banner always shows when a terminal is attached; Bark push is sent
+// only when a deviceKey is configured (same rule as the completion notify).
+async function notifyQuestion(
+  ctx: Pick<ExtensionContext, "hasUI" | "ui" | "signal">,
+  config: BarkConfig,
+  title: string,
+  body: string,
+): Promise<void> {
+  if (ctx.hasUI) {
+    ctx.ui.notify("Pi 任务已暂停 · 需要你回答", "info");
+  }
+  if (config.deviceKey) {
+    await sendBark(config, title, body, ctx.signal);
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   // Timestamp of when the current agent run started (null when idle).
   let startedAt: number | null = null;
   let outcome: "running" | "success" | "failed" | "aborted" = "success";
+
+  // "AI asked the user a question" detection.
+  let questionTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastQuestionPushAt = 0;
+
+  function clearQuestionTimer() {
+    if (questionTimer !== null) {
+      clearTimeout(questionTimer);
+      questionTimer = null;
+    }
+  }
 
   pi.on("agent_start", () => {
     // Keep the first start of a cycle so retries/compactions count together.
@@ -233,6 +357,11 @@ export default function (pi: ExtensionAPI) {
     startedAt = null;
     outcome = "success";
 
+    // Subagent child sessions (Agent tool / workflows) run their own copy of
+    // this extension; only the top-level session may notify, otherwise every
+    // finished subagent would push.
+    if (isSubagentSession(ctx)) return;
+
     const config = loadConfig();
     const thresholdMs = config.minutes * 60_000;
     if (
@@ -254,11 +383,64 @@ export default function (pi: ExtensionAPI) {
     await sendBark(config, "Pi 任务完成", body, ctx.signal);
   });
 
+  // Notify when the AI pauses to ask the user a blocking question. Pi fires
+  // ui_prompt_start around every ctx.ui.* prompt. ask_user_question renders
+  // through ctx.ui.editor() (text) or ctx.ui.custom() (single/multi-select),
+  // and any extension confirm/select/input/editor/custom prompt also blocks
+  // the task — so this is the reliable "waiting for user" signal.
+  pi.on("ui_prompt_start", async (event, ctx) => {
+    // Subagent child sessions run their own copy of this extension; only the
+    // top-level session may notify.
+    if (isSubagentSession(ctx)) return;
+
+    const config = loadConfig();
+    if (!config.notifyOnQuestion) return;
+
+    // Cooldown so a burst of prompts (or one answered moments ago) doesn't
+    // spam the watch.
+    if (Date.now() - lastQuestionPushAt < config.questionCooldownSec * 1000) {
+      return;
+    }
+
+    const kindLabel: Record<UIPromptKind, string> = {
+      editor: "Pi 需要你输入",
+      input: "Pi 需要你输入",
+      confirm: "Pi 需要你确认",
+      select: "Pi 需要你选择",
+      custom: "Pi 需要你回答",
+    };
+    const title = kindLabel[event.kind];
+    const body = (event.title?.trim() || "Pi 任务已暂停，等待你的回答。").slice(0, 120);
+
+    // Small delay so a user who answers immediately (before the delay) is not
+    // woken by a redundant push; ui_prompt_end cancels the timer. If they're
+    // away, the push fires after questionDelaySec.
+    const delayMs = Math.max(0, config.questionDelaySec * 1000);
+    if (delayMs === 0) {
+      lastQuestionPushAt = Date.now();
+      await notifyQuestion(ctx, config, title, body);
+      return;
+    }
+
+    clearQuestionTimer();
+    questionTimer = setTimeout(() => {
+      questionTimer = null;
+      lastQuestionPushAt = Date.now();
+      void notifyQuestion(ctx, config, title, body);
+    }, delayMs);
+  });
+
+  pi.on("ui_prompt_end", () => {
+    clearQuestionTimer();
+  });
+
   // Safety: clear state on shutdown so a stale timestamp never leaks into a
   // future session in the same process.
   pi.on("session_shutdown", () => {
     startedAt = null;
     outcome = "success";
+    clearQuestionTimer();
+    lastQuestionPushAt = 0;
   });
 
   // Manual test command so you can verify the whole pipeline.
