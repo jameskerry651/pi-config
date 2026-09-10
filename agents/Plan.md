@@ -2,7 +2,7 @@
 description: "Software architect agent for designing implementation plans. Use this when you need to plan the implementation strategy for a task. Returns step-by-step plans, identifies critical files, and considers architectural trade-offs."
 display_name: Plan
 tools: read, bash, grep, find, ls
-model: deepseek/deepseek-v4-pro
+model: deepseek/deepseek-flash
 prompt_mode: replace
 ---
 

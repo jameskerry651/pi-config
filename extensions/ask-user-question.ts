@@ -9,6 +9,7 @@ import {
 	wrapTextWithAnsi,
 } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
+import { randomUUID } from "node:crypto";
 
 interface AskOption {
 	label: string;
@@ -43,7 +44,7 @@ interface OtherAnswer {
 }
 
 type AskAnswer = TextAnswer | OptionAnswer | OtherAnswer;
-type AskUserQuestionStatus = "answered" | "cancelled" | "unavailable";
+type AskUserQuestionStatus = "answered" | "cancelled" | "unavailable" | "auto-decided";
 type AskUserQuestionMode = "text" | "single-select" | "multi-select";
 
 interface AskUserQuestionResultDetails {
@@ -53,6 +54,30 @@ interface AskUserQuestionResultDetails {
 	mode: AskUserQuestionMode;
 	answers: AskAnswer[];
 	message?: string;
+	/** Which context produced an automatic decision. */
+	decidedBy?: "main-agent" | "self";
+}
+
+interface MainAgentDecisionRequest {
+	question: string;
+	context?: string;
+	options: AskOption[];
+	multiSelect: boolean;
+	childLabel?: string;
+	childTask?: string;
+}
+
+/**
+ * In-process service published by the root session so that subagent (headless)
+ * sessions can ask the main agent for a decision. Everything here lives in the
+ * same process, so the bus is just globalThis — same pattern pi-subagents uses
+ * for its manager registry.
+ */
+interface MainAgentDecider {
+	token: symbol;
+	/** Session id of the root that published this decider (guards shutdown races). */
+	sessionId?: string;
+	decide(request: MainAgentDecisionRequest): Promise<string>;
 }
 
 const OptionSchema = Type.Object({
@@ -197,6 +222,240 @@ function buildResult(question: string, context: string | undefined, mode: AskUse
 	return {
 		content: [{ type: "text" as const, text }],
 		details: buildStructuredResult("answered", question, mode, answers, context),
+	};
+}
+
+// ─── Automatic decision when no human is available ──────────────────────────
+//
+// Subagent sessions are headless (pi never binds a UI context for a child
+// AgentSession, so `ctx.hasUI === false`). Instead of returning "unavailable"
+// and letting the subagent silently guess, the root session publishes a decider
+// service here; a child asks it and the root answers with a plain completion
+// that uses the main agent's model, system prompt and conversation snapshot.
+// No message is injected into the main conversation and no main-agent turn is
+// consumed, so a foreground subagent (parent blocked inside the Agent tool)
+// cannot deadlock.
+
+const MAIN_AGENT_DECIDER_KEY = Symbol.for("pi:ask-main-agent:decider");
+const AUTO_DECISION_TIMEOUT_MS = 90_000;
+const AUTO_DECISION_MAX_PER_SESSION = 6;
+const DECISION_CONTEXT_MAX_CHARS = 24_000;
+const DECISION_ENTRY_MAX_CHARS = 4_000;
+const DECISION_TASK_MAX_CHARS = 4_000;
+
+function getMainAgentDecider(): MainAgentDecider | undefined {
+	return (globalThis as unknown as Record<symbol, MainAgentDecider | undefined>)[MAIN_AGENT_DECIDER_KEY];
+}
+
+/**
+ * A subagent session is identified by its parent link (persisted children) or,
+ * for in-memory children (nested runs, `rememberAgents: false`), by the name
+ * pi-subagents assigns BEFORE `session_start` fires: `<type>#<agentId>`.
+ * `SessionManager.inMemory()` synthesizes a header WITHOUT `parentSession`, so
+ * the header alone would misclassify an in-memory child as a root and let it
+ * overwrite the real main-agent decider.
+ */
+function isSubagentSession(ctx: any): boolean {
+	try {
+		const header = ctx.sessionManager?.getHeader?.();
+		if (header?.parentSession) return true;
+	} catch {
+		// ignore
+	}
+	try {
+		const name = ctx.sessionManager?.getSessionName?.();
+		if (typeof name === "string" && /#[A-Za-z0-9_-]{6,16}$/.test(name)) return true;
+	} catch {
+		// ignore
+	}
+	return false;
+}
+
+function truncateText(text: string, maxChars: number): string {
+	if (text.length <= maxChars) return text;
+	return `${text.slice(0, maxChars)}\n[...truncated...]`;
+}
+
+function extractTextContent(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	const parts: string[] = [];
+	for (const block of content) {
+		if (!block || typeof block !== "object") continue;
+		const typed = block as { type?: string; text?: string; name?: string };
+		if (typed.type === "text" && typeof typed.text === "string") parts.push(typed.text);
+		else if (typed.type === "toolCall" && typeof typed.name === "string") parts.push(`[called tool ${typed.name}]`);
+	}
+	return parts.join("\n");
+}
+
+/** Tail of a session's conversation, oldest-first, bounded by maxChars. */
+function buildConversationSnapshot(ctx: any, maxChars: number): string {
+	let branch: any[] = [];
+	try {
+		branch = ctx.sessionManager?.getBranch?.() ?? [];
+	} catch {
+		return "";
+	}
+
+	const parts: string[] = [];
+	for (const entry of branch) {
+		if (entry?.type === "compaction" && typeof entry.summary === "string") {
+			parts.push(`[Earlier conversation summary]\n${truncateText(entry.summary, DECISION_ENTRY_MAX_CHARS)}`);
+			continue;
+		}
+		if (entry?.type !== "message") continue;
+		const role = entry.message?.role;
+		if (role !== "user" && role !== "assistant") continue;
+		const text = extractTextContent(entry.message.content).trim();
+		if (!text) continue;
+		parts.push(`${role === "user" ? "User" : "Assistant"}: ${truncateText(text, DECISION_ENTRY_MAX_CHARS)}`);
+	}
+
+	let joined = "";
+	for (let i = parts.length - 1; i >= 0; i--) {
+		const candidate = joined ? `${parts[i]}\n\n${joined}` : parts[i];
+		if (candidate.length > maxChars) {
+			joined = `[... earlier conversation truncated ...]\n\n${joined}`;
+			break;
+		}
+		joined = candidate;
+	}
+	return joined.trim();
+}
+
+/** The brief a subagent was spawned with (its first user message). */
+function getChildTaskBrief(ctx: any): string | undefined {
+	try {
+		const branch = ctx.sessionManager?.getBranch?.() ?? [];
+		for (const entry of branch) {
+			if (entry?.type !== "message" || entry.message?.role !== "user") continue;
+			const text = extractTextContent(entry.message.content).trim();
+			if (text) return truncateText(text, DECISION_TASK_MAX_CHARS);
+		}
+	} catch {
+		// fall through
+	}
+	return undefined;
+}
+
+function buildDecisionPrompt(request: MainAgentDecisionRequest, snapshot: string): string {
+	const lines: string[] = [];
+	lines.push(
+		"You are the main agent in this conversation. One of your subagents cannot reach a human user — this session has no interactive UI — so it asked you to decide instead. Use the conversation above (your plan, constraints, and earlier decisions) and answer decisively.",
+	);
+	lines.push("");
+	if (snapshot) {
+		lines.push("## Your conversation so far");
+		lines.push(snapshot);
+		lines.push("");
+	}
+	lines.push("## Subagent request");
+	if (request.childLabel) lines.push(`Subagent: ${request.childLabel}`);
+	if (request.childTask) lines.push(`Subagent task: ${request.childTask}`);
+	lines.push(`Question: ${request.question}`);
+	if (request.context) lines.push(`Extra context: ${request.context}`);
+	if (request.options.length > 0) {
+		lines.push(
+			request.multiSelect
+				? "Options (choose one or more, or give a direct instruction if none fits):"
+				: "Options (choose one, or give a direct instruction if none fits):",
+		);
+		for (const [index, option] of request.options.entries()) {
+			lines.push(`${index + 1}. ${option.label}${option.description ? ` — ${option.description}` : ""}`);
+		}
+	}
+	lines.push("");
+	lines.push("Do not call any tools. Reply with exactly these two lines and nothing else:");
+	lines.push("DECISION: <the option label verbatim, or a concise directive>");
+	lines.push("REASON: <one short sentence>");
+	return lines.join("\n");
+}
+
+function parseDecision(text: string): { decision: string; reason?: string } {
+	const decision = text.match(/^\s*DECISION\s*:\s*(.+?)\s*$/im)?.[1];
+	const reason = text.match(/^\s*REASON\s*:\s*(.+?)\s*$/im)?.[1];
+	return { decision: (decision || text.trim()).trim(), reason: reason?.trim() };
+}
+
+function matchOptionAnswer(decision: string, options: AskOption[]): AskAnswer | undefined {
+	const normalized = decision
+		.toLowerCase()
+		.replace(/^\d+[.)]\s*/, "")
+		.trim();
+	for (const [index, option] of options.entries()) {
+		const label = option.label.toLowerCase().trim();
+		if (normalized === label || normalized.startsWith(label) || label.startsWith(normalized)) {
+			return { type: "option", label: option.label, value: option.value, index: index + 1 };
+		}
+	}
+	return undefined;
+}
+
+/** One independent completion using the given context's model/state. */
+async function runDecider(ctx: any, request: MainAgentDecisionRequest): Promise<string> {
+	const model = ctx.model ?? ctx.modelRegistry?.getAll?.()[0];
+	if (!model) throw new Error("no model available for automatic decision");
+
+	let systemPrompt = "";
+	try {
+		systemPrompt = ctx.getSystemPrompt?.() ?? "";
+	} catch {
+		systemPrompt = "";
+	}
+
+	const snapshot = buildConversationSnapshot(ctx, DECISION_CONTEXT_MAX_CHARS);
+	const response = await ctx.modelRegistry.complete(
+		model,
+		{
+			systemPrompt,
+			messages: [
+				{
+					role: "user",
+					content: [{ type: "text", text: buildDecisionPrompt(request, snapshot) }],
+					timestamp: Date.now(),
+				},
+			],
+		},
+		{
+			cacheRetention: "none",
+			sessionId: randomUUID(),
+			signal: AbortSignal.timeout(AUTO_DECISION_TIMEOUT_MS),
+		},
+	);
+
+	const text = extractTextContent(response?.content).trim();
+	if (!text) throw new Error("automatic decision returned no text");
+	return text;
+}
+
+function buildAutoDecidedResult(
+	question: string,
+	context: string | undefined,
+	mode: AskUserQuestionMode,
+	decisionText: string,
+	options: AskOption[],
+	decidedBy: "main-agent" | "self",
+) {
+	const { decision, reason } = parseDecision(decisionText);
+	const matched = mode === "single-select" ? matchOptionAnswer(decision, options) : undefined;
+	const answer: AskAnswer = matched ?? { type: "text", label: decision, value: decision };
+	const who = decidedBy === "main-agent" ? "the main agent" : "this agent (no main agent available)";
+	const text = [
+		`[auto-decided — no human available; decided by ${who}]`,
+		`Decision: ${decision}`,
+		reason ? `Reason: ${reason}` : undefined,
+		"Treat this as the user's answer and proceed. Do not ask again; if it conflicts with your task constraints, state the conflict in your final report.",
+	]
+		.filter(Boolean)
+		.join("\n");
+
+	return {
+		content: [{ type: "text" as const, text }],
+		details: {
+			...buildStructuredResult("auto-decided", question, mode, [answer], context),
+			decidedBy,
+		},
 	};
 }
 
@@ -566,11 +825,48 @@ function withUILock<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 export default function askUserQuestion(pi: ExtensionAPI) {
+	const activationToken = Symbol("ask-main-agent-activation");
+	let autoDecisionCount = 0;
+
+	// Only a root session (not spawned as a subagent) serves decisions. Persisted
+	// children carry `parentSession`; in-memory children only carry the
+	// `<type>#<agentId>` session name. See isSubagentSession().
+	pi.on("session_start", (_event, ctx) => {
+		if (isSubagentSession(ctx)) return;
+		let sessionId: string | undefined;
+		try {
+			sessionId = ctx.sessionManager.getSessionId();
+		} catch {
+			sessionId = undefined;
+		}
+		const decider: MainAgentDecider = {
+			token: activationToken,
+			sessionId,
+			decide: (request) => runDecider(ctx, request),
+		};
+		(globalThis as unknown as Record<symbol, MainAgentDecider>)[MAIN_AGENT_DECIDER_KEY] = decider;
+	});
+
+	pi.on("session_shutdown", (_event, ctx) => {
+		const current = getMainAgentDecider();
+		if (current?.token !== activationToken) return;
+		let sessionId: string | undefined;
+		try {
+			sessionId = ctx.sessionManager.getSessionId();
+		} catch {
+			sessionId = undefined;
+		}
+		// A session switch can start the replacement before this shutdown fires.
+		// Only remove the decider this exact session published.
+		if (sessionId && current.sessionId && sessionId !== current.sessionId) return;
+		delete (globalThis as unknown as Record<symbol, MainAgentDecider | undefined>)[MAIN_AGENT_DECIDER_KEY];
+	});
+
 	pi.registerTool({
 		name: "ask_user_question",
 		label: "ask_user_question",
 		description:
-			"Ask the user a single question and pause execution until they answer. Use this when requirements are ambiguous, user preferences are needed, a decision would materially affect implementation, or you need confirmation before proceeding. Ask exactly one question per tool call, and prefer multiple separate tool calls over bundling unrelated questions together.",
+			"Ask the user a single question and pause execution until they answer. Use this when requirements are ambiguous, user preferences are needed, a decision would materially affect implementation, or you need confirmation before proceeding. Ask exactly one question per tool call, and prefer multiple separate tool calls over bundling unrelated questions together. If no human is available (subagent or headless session), the question is automatically routed to the main agent, which decides for you and returns that decision — treat it as final.",
 		promptSnippet:
 			"Use this tool to ask exactly one clarifying question, missing-requirement question, preference question, or decision question before continuing.",
 		promptGuidelines: [
@@ -581,6 +877,8 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			'If you recommend a specific option, make it the first option in the list and add "(Recommended)" at the end of the label.',
 			"Prefer this tool over guessing when requirements, preferences, or implementation choices are unclear.",
 			"Use this tool when multiple valid implementation paths exist and the preferred path depends on user choice.",
+			"In a subagent or other session with no human user, this tool automatically asks the main agent to decide and returns its answer. Use it instead of silently guessing when a decision would materially change the work, but do not use it for trivial choices.",
+			"When the result says it was auto-decided, treat that decision as final and proceed. Do not ask the same question again; if it conflicts with your task constraints, state the conflict in your final report.",
 		],
 		parameters: AskUserQuestionParams,
 
@@ -594,7 +892,52 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			}
 
 			if (!ctx.hasUI) {
-				return unavailableResult(params.question, mode, "ask_user_question requires interactive mode UI", context);
+				if (autoDecisionCount >= AUTO_DECISION_MAX_PER_SESSION) {
+					return unavailableResult(
+						params.question,
+						mode,
+						`ask_user_question auto-decision limit reached (${AUTO_DECISION_MAX_PER_SESSION}) and no human is available. Decide yourself and note the open question in your final report.`,
+						context,
+					);
+				}
+				autoDecisionCount += 1;
+
+				const request: MainAgentDecisionRequest = {
+					question: params.question,
+					context,
+					options,
+					multiSelect: mode === "multi-select",
+					childLabel: (() => {
+						try {
+							return ctx.sessionManager.getSessionName();
+						} catch {
+							return undefined;
+						}
+					})(),
+					childTask: getChildTaskBrief(ctx),
+				};
+
+				const decider = getMainAgentDecider();
+				if (decider) {
+					try {
+						const decision = await decider.decide(request);
+						return buildAutoDecidedResult(params.question, context, mode, decision, options, "main-agent");
+					} catch {
+						// The root is gone or its model failed — fall back to a local decision.
+					}
+				}
+
+				try {
+					const decision = await runDecider(ctx, request);
+					return buildAutoDecidedResult(params.question, context, mode, decision, options, "self");
+				} catch (error) {
+					return unavailableResult(
+						params.question,
+						mode,
+						`ask_user_question has no UI and the automatic decision failed: ${error instanceof Error ? error.message : String(error)}. Decide yourself and note the open question in your final report.`,
+						context,
+					);
+				}
 			}
 
 			return withUILock(async () => {
@@ -651,6 +994,19 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 
 			if (details.status === "unavailable") {
 				return new Text(theme.fg("warning", details.message || "ask_user_question unavailable"), 0, 0);
+			}
+
+			if (details.status === "auto-decided") {
+				const who = details.decidedBy === "main-agent" ? "main agent" : "self";
+				const lines = [theme.fg("warning", `⚡ auto-decided (${who})`)];
+				for (const answer of details.answers) {
+					lines.push(
+						answer.type === "option"
+							? `${theme.fg("success", "✓ ")}${theme.fg("accent", `${answer.index}. ${answer.label}`)}`
+							: `${theme.fg("success", "✓ ")}${theme.fg("accent", answer.label)}`,
+					);
+				}
+				return new Text(lines.join("\n"), 0, 0);
 			}
 
 			const lines = details.answers.map((answer) => {

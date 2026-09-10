@@ -1,13 +1,26 @@
 {
-  "lastChangelogVersion": "0.84.4",
+  "lastChangelogVersion": "0.85.1",
   "theme": "dark",
   "defaultProvider": "deepseek",
-  "defaultModel": "deepseek-v4-flash-vision-exp",
+  "defaultModel": "deepseek-flash",
   "tuiMode": "fullscreen",
   "shellPath": "/Users/james/.pi/bin/zsh-wrapper",
   "packages": [
     "npm:@tintinweb/pi-subagents",
     "npm:pi-web-access",
-    "npm:@sentiolabs/pi-frontend-design"
+    {
+      "source": "npm:@sentiolabs/pi-frontend-design",
+      "skills": [
+        "-skills/frontend-design/SKILL.md"
+      ],
+      "prompts": [
+        "-prompts/frontend-design.md"
+      ]
+    },
+    "npm:@narumitw/pi-chrome-devtools"
+  ],
+  "skills": [
+    "-skills/brainstorming/SKILL.md",
+    "-skills/training-monitor/SKILL.md"
   ]
 }

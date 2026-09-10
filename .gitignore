@@ -13,6 +13,9 @@ sessions/
 bin/
 *.log
 
+# Update-check cache — rewritten by pi, machine-specific timestamps
+pi-web-update-check.json
+
 # Dependencies — rebuilt via `npm install`.
 # node_modules/ matches at any depth (npm/node_modules, extensions/browser/node_modules)
 node_modules/
@@ -38,3 +41,7 @@ extensions/pi-bark-watch/config.json
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Python bytecode (imessage-cleanup scan script)
+__pycache__/
+*.pyc
