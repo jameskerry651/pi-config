@@ -25,9 +25,10 @@
  *   sound       -> PI_BARK_WATCH_SOUND     default "minuet"
  *   level       -> PI_BARK_WATCH_LEVEL     optional "critical"|"active"|"timeSensitive"|"passive"
  *
- * Also pushes when the AI blocks on a question (ask_user_question / any
- * ctx.ui.* prompt -> ui_prompt_start):
+ * Also pushes when the AI blocks on a question (ask_user_question ->
+ * ui_prompt_start with the tool still executing):
  *   notifyOnQuestion    -> PI_BARK_WATCH_QUESTION           default true
+ *   questionTools       -> PI_BARK_WATCH_QUESTION_TOOLS     default "ask_user_question"
  *   questionDelaySec    -> PI_BARK_WATCH_QUESTION_DELAY     default 3
  *   questionCooldownSec -> PI_BARK_WATCH_QUESTION_COOLDOWN  default 30
  *
@@ -58,6 +59,7 @@ interface BarkConfig {
   sound: string;
   level: "critical" | "active" | "timeSensitive" | "passive";
   notifyOnQuestion: boolean;
+  questionTools: string[];
   questionDelaySec: number;
   questionCooldownSec: number;
 }
@@ -67,6 +69,12 @@ const DEFAULT_MINUTES = 3;
 const DEFAULT_SOUND = "minuet";
 const DEFAULT_LEVEL: BarkConfig["level"] = "active";
 const DEFAULT_NOTIFY_ON_QUESTION = true;
+// Only prompts whose originating tool is in this list may wake the watch.
+// `ui_prompt_start` fires for every ctx.ui.* prompt and carries no source
+// info, so a long-lived interactive UI (notably resource-manager's
+// /resources selector) looks identical to ask_user_question. Tracking the
+// in-flight tool is the only reliable discriminator.
+const DEFAULT_QUESTION_TOOLS = ["ask_user_question"];
 const DEFAULT_QUESTION_DELAY_SEC = 3;
 const DEFAULT_QUESTION_COOLDOWN_SEC = 30;
 const BARK_REQUEST_TIMEOUT_MS = 10_000;
@@ -93,6 +101,19 @@ function asBool(value: unknown, fallback: boolean): boolean {
     if (["0", "false", "no", "n", "off"].includes(v)) return false;
   }
   return fallback;
+}
+
+function asStringArray(value: unknown, fallback: string[]): string[] {
+  const raw = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(",")
+      : null;
+  if (!raw) return fallback;
+  const items = raw
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter((item) => item.length > 0);
+  return items.length > 0 ? items : fallback;
 }
 
 function asNonNegativeNumber(value: unknown, fallback: number): number {
@@ -179,6 +200,10 @@ function loadConfig(): BarkConfig {
       process.env.PI_BARK_WATCH_QUESTION ?? file.notifyOnQuestion,
       DEFAULT_NOTIFY_ON_QUESTION,
     ),
+    questionTools: asStringArray(
+      process.env.PI_BARK_WATCH_QUESTION_TOOLS ?? file.questionTools,
+      DEFAULT_QUESTION_TOOLS,
+    ),
     questionDelaySec: asNonNegativeNumber(
       process.env.PI_BARK_WATCH_QUESTION_DELAY ?? file.questionDelaySec,
       DEFAULT_QUESTION_DELAY_SEC,
@@ -208,35 +233,39 @@ function formatDuration(ms: number): string {
  * the same global extensions, so each child gets its own copy of this
  * extension and its own agent_settled events. Detection signals:
  *
- *   1. The session header carries a parentSession — persisted subagent
- *      sessions (rememberAgents defaults to true) record their spawning
- *      session as parent. Top-level interactive sessions never have one.
- *   2. The session is in-memory (no session file) while the pi-subagents
- *      manager registry exists in this process — nested and workflow
- *      children are in-memory by default.
+ *   1. The session header carries a parentSession AND the session was bound
+ *      in the host's "print" mode. pi-subagents binds every in-process child
+ *      that way, while a top-level TUI/RPC/JSON session never is.
+ *
+ *      parentSession alone is no longer a safe signal: pi writes it for
+ *      top-level forks too (/fork, --fork, ctx.newSession({parentSession})),
+ *      so treating it as "subagent" would mute the user's own session.
+ *   2. The session name matches pi-subagents' child naming
+ *      (`subagent-<agent>-<runId>`, or the older `<type>#<agentId>`). This
+ *      covers children whose parent had no session file to record (for
+ *      example `--no-session`), where signal 1 cannot fire.
  *
  * On any introspection failure we assume a top-level session: a wrongly
  * silenced notification is worse than a rare extra one.
  */
 function isSubagentSession(
-  ctx: Pick<ExtensionContext, "sessionManager">,
+  ctx: Pick<ExtensionContext, "sessionManager" | "mode">,
 ): boolean {
   const sm = ctx.sessionManager;
   if (!sm) return false;
   try {
     const header = sm.getHeader?.() ?? null;
+    const hasParent =
+      typeof header?.parentSession === "string" &&
+      header.parentSession.length > 0;
+    if (hasParent && ctx.mode === "print") return true;
+
+    const name = sm.getSessionName?.();
     if (
-      header &&
-      typeof header.parentSession === "string" &&
-      header.parentSession.length > 0
+      typeof name === "string" &&
+      (/^subagent-/.test(name) || /#[A-Za-z0-9_-]{6,16}$/.test(name))
     ) {
       return true;
-    }
-    if (typeof sm.getSessionFile === "function" && !sm.getSessionFile()) {
-      const registry = (
-        globalThis as unknown as Record<symbol, unknown>
-      )[Symbol.for("pi-subagents:manager")];
-      return registry !== undefined;
     }
   } catch {
     // ignore — fall through to "top-level"
@@ -323,6 +352,18 @@ export default function (pi: ExtensionAPI) {
   let questionTimer: ReturnType<typeof setTimeout> | null = null;
   let lastQuestionPushAt = 0;
 
+  // Tool calls currently executing in this session (toolCallId -> toolName).
+  // Used to tell an ask_user_question prompt apart from any other ctx.ui.*
+  // prompt, since ui_prompt_start itself carries no source information.
+  const activeToolCalls = new Map<string, string>();
+
+  function isQuestionToolActive(config: BarkConfig): boolean {
+    for (const toolName of activeToolCalls.values()) {
+      if (config.questionTools.includes(toolName)) return true;
+    }
+    return false;
+  }
+
   function clearQuestionTimer() {
     if (questionTimer !== null) {
       clearTimeout(questionTimer);
@@ -383,17 +424,28 @@ export default function (pi: ExtensionAPI) {
     await sendBark(config, "Pi 任务完成", body, ctx.signal);
   });
 
+  pi.on("tool_execution_start", (event) => {
+    activeToolCalls.set(event.toolCallId, event.toolName);
+  });
+
+  pi.on("tool_execution_end", (event) => {
+    activeToolCalls.delete(event.toolCallId);
+  });
+
   // Notify when the AI pauses to ask the user a blocking question. Pi fires
-  // ui_prompt_start around every ctx.ui.* prompt. ask_user_question renders
-  // through ctx.ui.editor() (text) or ctx.ui.custom() (single/multi-select),
-  // and any extension confirm/select/input/editor/custom prompt also blocks
-  // the task — so this is the reliable "waiting for user" signal.
+  // ui_prompt_start around every ctx.ui.* prompt, but that also covers the
+  // /resources selector and any extension confirm/select/editor/custom UI.
+  // Only prompts raised by a question tool (ask_user_question by default)
+  // may push, so an interactive selector the user is still driving does not
+  // masquerade as "the AI is waiting for an answer".
   pi.on("ui_prompt_start", async (event, ctx) => {
     // Subagent child sessions run their own copy of this extension; only the
     // top-level session may notify.
     if (isSubagentSession(ctx)) return;
 
     const config = loadConfig();
+    if (!isQuestionToolActive(config)) return;
+
     if (!config.notifyOnQuestion) return;
 
     // Cooldown so a burst of prompts (or one answered moments ago) doesn't
@@ -441,6 +493,7 @@ export default function (pi: ExtensionAPI) {
     outcome = "success";
     clearQuestionTimer();
     lastQuestionPushAt = 0;
+    activeToolCalls.clear();
   });
 
   // Manual test command so you can verify the whole pipeline.

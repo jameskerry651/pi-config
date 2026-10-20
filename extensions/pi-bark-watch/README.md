@@ -2,7 +2,7 @@
 
 当 Agent 执行的任务**超过限定时间**（默认 3 分钟）并**完成**时，通过 **Bark** 推送一条系统通知到你的 iPhone，并进一步转发到 **Apple Watch**。
 
-此外，当 AI **向用户提问**（`ask_user_question` 或任何会阻塞任务的弹窗）导致任务被问题阻塞时，也会推送一条提醒，让你知道需要及时回来处理。
+此外，当 AI 调用 `ask_user_question` **向用户提问**并阻塞等待回答时，也会推送一条提醒，让你知道需要及时回来处理。（其他 `ctx.ui.*` 弹窗，例如 `/resources` 选择器，默认**不会**推送；可用 `questionTools` 调整。）
 
 ---
 
@@ -38,6 +38,7 @@ Bark 是免费、开源、支持自定义服务端的推送工具，一条 HTTP 
   "sound": "minuet",
   "level": "active",
   "notifyOnQuestion": true,
+  "questionTools": ["ask_user_question"],
   "questionDelaySec": 3,
   "questionCooldownSec": 30
 }
@@ -89,6 +90,7 @@ Device Key 一旦泄露，应在 Bark 中轮换后再更新配置。
 | `sound` | `PI_BARK_WATCH_SOUND` | 系统提示音 | `minuet` |
 | `level` | `PI_BARK_WATCH_LEVEL` | 通知级别（`critical`/`active`/`timeSensitive`/`passive`） | `active` |
 | `notifyOnQuestion` | `PI_BARK_WATCH_QUESTION` | AI 提问阻塞时是否提醒 | `true` |
+| `questionTools` | `PI_BARK_WATCH_QUESTION_TOOLS` | 只有这些工具发起的弹窗才提醒（逗号分隔） | `ask_user_question` |
 | `questionDelaySec` | `PI_BARK_WATCH_QUESTION_DELAY` | 提问后等待多少秒才推送（用户马上回答则不推） | `3` |
 | `questionCooldownSec` | `PI_BARK_WATCH_QUESTION_COOLDOWN` | 两次提问提醒的最小间隔（秒） | `30` |
 
@@ -97,13 +99,17 @@ Device Key 一旦泄露，应在 Bark 中轮换后再更新配置。
 
 ## AI 提问阻塞提醒
 
-当 AI 调用 `ask_user_question`（或任何通过 `ctx.ui.*` 弹出、阻塞任务的确认/选择/输入框）时，Pi 会触发 `ui_prompt_start` 事件，代表此刻开始**等待用户输入**。本扩展借此向你的 iPhone / 手表推送一条「任务已暂停，需要你回答」的提醒，让你在离开键盘时能及时回来处理。
+当 AI 调用 `ask_user_question` 并**阻塞等待你回答**时，本扩展会向你的 iPhone / 手表推送一条「任务已暂停，需要你回答」的提醒，让你在离开键盘时能及时回来处理。
+
+> 只对 `questionTools`（默认 `ask_user_question`）里工具发起的弹窗推送。Pi 的 `ui_prompt_start` 事件对**所有** `ctx.ui.*` 弹窗都会触发，且不携带来源信息；如果不加这个过滤，`/resources` 交互选择器（`ctx.ui.custom`）、其他扩展的确认框等都会被误判为「AI 在等你回答」，而选择器往往要停留好几秒，于是就会产生一次莫名其妙的推送。扩展通过跟踪正在执行的工具（`tool_execution_start` / `tool_execution_end`）来区分。
 
 默认行为：
 
+- **仅 `ask_user_question`**：只有该工具仍在执行时弹出的 UI 才会推送；`/resources` 选择器、其他扩展的 confirm/select/editor/custom 弹窗一律静默。
 - **延迟 3 秒**才推送（`questionDelaySec`）——如果你就在终端前、马上回答了，`ui_prompt_end` 会取消定时器，你不会收到多余的推送；若你不在，3 秒后即收到提醒。
 - **30 秒冷却**（`questionCooldownSec`）——避免一连串弹窗时持续轰炸手表。
 - 想立即推送（不等待延迟），把 `questionDelaySec` 设为 `0`。
+- 想让其他阻塞弹窗也提醒，把对应工具名加进 `questionTools`（例如 `"questionTools": ["ask_user_question", "resource_manager"]`）。
 
 > 该提醒复用 Bark 推送通路，且同样只在**顶层会话**生效（子代理会话静默，见下）。
 
@@ -111,14 +117,16 @@ Device Key 一旦泄露，应在 Bark 中轮换后再更新配置。
 
 安装 `@tintinweb/pi-subagents` 后，`Agent` / `SubagentWorkflow` 工具会在**同进程**内为每个子代理创建独立的 `AgentSession`，而子会话同样会加载本扩展。因此不加防护时，**每个子代理任务结束都会触发一次推送**。
 
-本扩展会在 `agent_settled` 里识别子会话并保持静默，只允许**顶层会话**（你直接对话的主任务）推送。判定依据：
+本扩展会在 `agent_settled` / `ui_prompt_start` 里识别子会话并保持静默，只允许**顶层会话**（你直接对话的主任务）推送。判定依据：
 
-1. 会话 header 带 `parentSession`（`rememberAgents` 默认开启时，持久化子代理会话会记录父会话，顶层会话没有此字段）；
-2. 无会话文件（内存会话，嵌套子代理 / workflow 子代理的默认形态），且进程内存在 pi-subagents 的 manager 注册表（`Symbol.for("pi-subagents:manager")`）。
+1. 会话 header 带 `parentSession`，**并且**扩展以 `print` 模式绑定。pi-subagents 的同进程子会话固定以 print 模式绑定扩展；顶层交互会话是 `tui` / `rpc` / `json`，即使 `/fork`、`--fork` 或 `ctx.newSession({ parentSession })` 也写入了 `parentSession`，也不会被误判。
+2. 会话名匹配 pi-subagents 的子会话命名（`subagent-<agent>-<runId>`，或旧版的 `<type>#<agentId>`）。用于兜底：父会话没有落盘文件时（例如 `--no-session`），子会话 header 里没有 `parentSession`，只能靠命名识别。
+
+> 旧版本依赖的 `Symbol.for("pi-subagents:manager")` 注册表在 pi-subagents 0.79 起已不存在，该判定已移除。
 
 任何识别失败都会回退为「顶层会话」处理 —— 宁可多推一条，也不沉默地丢失通知。
 
-> 已知边界：极少数使用 `ctx.newSession()` 做会话替换的扩展（如 handoff）也会在新会话 header 里写 `parentSession`，此时新会话也会被当作子代理而静默。未使用这类扩展则无影响。
+> 已知边界：`pi -p --fork <session>` 这类**顶层 print 模式**会话仍会被当作子会话而静默；手动把顶层会话命名为 `subagent-*` 也会静默。正常交互使用不受影响。
 
 ---
 
@@ -127,7 +135,8 @@ Device Key 一旦泄露，应在 Bark 中轮换后再更新配置。
 - `agent_start`：记录本次任务开始时间（同一轮里的自动重试 / 压缩不算新任务，只保留首次开始）。
 - `agent_end`：记录本轮最终结果；失败或手动取消的任务不会冒充“完成”发送通知。
 - `agent_settled`：Pi 确认不会自动继续运行后触发，计算耗时；若处于**子代理会话**（Agent / workflow 子任务）则直接静默返回；仅顶层会话中成功任务在 `耗时 >= minutes` 且已配置 `deviceKey` 时发送 Bark 推送，并在本地 TUI 弹出一条通知。Bark 请求最多等待 10 秒。
-- `ui_prompt_start`：Pi 开始**等待用户输入**时触发（`ask_user_question` 或其他 `ctx.ui.*` 弹窗）。若处于子代理会话则静默；否则按 `notifyOnQuestion` 开关与延迟/冷却策略发送提问提醒。
+- `ui_prompt_start`：Pi 开始弹出阻塞 UI 时触发。仅当发起该 UI 的工具属于 `questionTools`（默认 `ask_user_question`）且处于子代理会话静默之外时才处理，再按 `notifyOnQuestion` 开关与延迟/冷却策略发送提问提醒。
+- `tool_execution_start` / `tool_execution_end`：记录当前正在执行的工具，用于区分 `ask_user_question` 的弹窗与其他 `ctx.ui.*` 弹窗（如 `/resources` 选择器）。
 - `ui_prompt_end`：用户回答完毕、Pi 不再等待时触发；若在 `questionDelaySec` 前回答，会取消尚未发送的定时推送。
 - `session_shutdown`：清理状态，防止同一进程里跨会话残留旧时间。
 
