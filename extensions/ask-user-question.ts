@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	Editor,
 	type EditorTheme,
@@ -7,8 +7,8 @@ import {
 	matchesKey,
 	truncateToWidth,
 	wrapTextWithAnsi,
-} from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+} from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
 
 interface AskOption {
@@ -127,6 +127,95 @@ function normalizeOptions(options: Array<{ label: string; value?: string; descri
 
 function getOtherLabel(options: AskOption[]): string {
 	return options.some((option) => option.label.toLowerCase() === "other") ? "Other (custom)" : "Other";
+}
+
+/** Parse the free-form answer used for multi-select questions on clients without a multi-select dialog. */
+function parseMultiSelectInput(input: string, options: AskOption[]): AskAnswer[] {
+	const answers: AskAnswer[] = [];
+	const chosen = new Set<number>();
+	const otherLabels = new Set<string>();
+
+	for (const rawPart of input.split(/[,，;；\n]/)) {
+		const part = rawPart.trim();
+		if (!part) continue;
+
+		const numeric = /^\d+$/.test(part) ? Number.parseInt(part, 10) : Number.NaN;
+		if (Number.isInteger(numeric) && numeric >= 1 && numeric <= options.length) {
+			if (chosen.has(numeric)) continue;
+			chosen.add(numeric);
+			const option = options[numeric - 1];
+			answers.push({ type: "option", label: option.label, value: option.value, index: numeric });
+			continue;
+		}
+		// The "Other" entry without custom text cannot be represented as an answer.
+		if (numeric === options.length + 1) continue;
+
+		const matched = options.findIndex((option) => option.label.toLowerCase() === part.toLowerCase());
+		if (matched >= 0) {
+			if (chosen.has(matched + 1)) continue;
+			chosen.add(matched + 1);
+			answers.push({
+				type: "option",
+				label: options[matched].label,
+				value: options[matched].value,
+				index: matched + 1,
+			});
+			continue;
+		}
+
+		if (otherLabels.has(part.toLowerCase())) continue;
+		otherLabels.add(part.toLowerCase());
+		answers.push({ type: "other", label: part, value: part });
+	}
+
+	return answers;
+}
+
+/**
+ * Dialog-based fallback for clients that support `select` / `input` but not
+ * `custom()` (RPC and other embedded hosts). `ctx.mode === "tui"` is the only
+ * mode where `ctx.ui.custom()` renders a component.
+ */
+async function askWithDialogs(
+	ctx: ExtensionContext,
+	question: string,
+	context: string | undefined,
+	options: AskOption[],
+	mode: AskUserQuestionMode,
+) {
+	const title = context ? `${question}\n\n${context}` : question;
+
+	if (mode === "single-select") {
+		const otherLabel = getOtherLabel(options);
+		const labels = [...options.map((option) => option.label), otherLabel];
+		const choice = await ctx.ui.select(title, labels);
+		if (choice === undefined) return cancelledResult(question, mode, context);
+
+		const index = labels.indexOf(choice);
+		if (index >= 0 && index < options.length) {
+			const option = options[index];
+			return buildResult(question, context, mode, [
+				{ type: "option", label: option.label, value: option.value, index: index + 1 },
+			]);
+		}
+
+		const custom = await ctx.ui.input("Write your custom answer:");
+		if (custom === undefined) return cancelledResult(question, mode, context);
+		const label = custom.trim();
+		return buildResult(question, context, mode, [{ type: "other", label, value: label }]);
+	}
+
+	const lines = [title, "", "Reply with comma-separated numbers or option labels.", ""];
+	for (const [index, option] of options.entries()) {
+		lines.push(`${index + 1}. ${option.label}${option.description ? ` — ${option.description}` : ""}`);
+	}
+	lines.push(`${options.length + 1}. ${getOtherLabel(options)}`);
+
+	const raw = await ctx.ui.input(lines.join("\n"));
+	if (raw === undefined) return cancelledResult(question, mode, context);
+	const answers = parseMultiSelectInput(raw, options);
+	if (answers.length === 0) return cancelledResult(question, mode, context);
+	return buildResult(question, context, mode, sortAnswers(answers));
 }
 
 function createEditorTheme(theme: any): EditorTheme {
@@ -248,26 +337,23 @@ function getMainAgentDecider(): MainAgentDecider | undefined {
 }
 
 /**
- * A subagent session is identified by its parent link (persisted children) or,
- * for in-memory children (nested runs, `rememberAgents: false`), by the name
- * pi-subagents assigns BEFORE `session_start` fires: `<type>#<agentId>`.
- * `SessionManager.inMemory()` synthesizes a header WITHOUT `parentSession`, so
- * the header alone would misclassify an in-memory child as a root and let it
- * overwrite the real main-agent decider.
+ * A subagent session is identified by its parent link (persisted and in-process
+ * children) or by the `PI_SUBAGENT_CHILD=1` marker pi-subagents sets for
+ * spawned children. The old `<type>#<agentId>` session-name heuristic was
+ * removed: current pi-subagents names children `agent: <task excerpt>`.
  */
-function isSubagentSession(ctx: any): boolean {
+function isSubagentSession(ctx: ExtensionContext): boolean {
 	try {
-		const header = ctx.sessionManager?.getHeader?.();
+		const header = ctx.sessionManager.getHeader();
 		if (header?.parentSession) return true;
 	} catch {
 		// ignore
 	}
-	try {
-		const name = ctx.sessionManager?.getSessionName?.();
-		if (typeof name === "string" && /#[A-Za-z0-9_-]{6,16}$/.test(name)) return true;
-	} catch {
-		// ignore
-	}
+	// pi-subagents marks spawned child processes with this env var. In-process
+	// children are covered by the parentSession header above; the old
+	// `<type>#<id>` session-name heuristic no longer matches (current
+	// pi-subagents names children `agent: <task excerpt>`).
+	if (process.env.PI_SUBAGENT_CHILD === "1") return true;
 	return false;
 }
 
@@ -290,10 +376,10 @@ function extractTextContent(content: unknown): string {
 }
 
 /** Tail of a session's conversation, oldest-first, bounded by maxChars. */
-function buildConversationSnapshot(ctx: any, maxChars: number): string {
+function buildConversationSnapshot(ctx: ExtensionContext, maxChars: number): string {
 	let branch: any[] = [];
 	try {
-		branch = ctx.sessionManager?.getBranch?.() ?? [];
+		branch = ctx.sessionManager.getBranch() ?? [];
 	} catch {
 		return "";
 	}
@@ -325,9 +411,9 @@ function buildConversationSnapshot(ctx: any, maxChars: number): string {
 }
 
 /** The brief a subagent was spawned with (its first user message). */
-function getChildTaskBrief(ctx: any): string | undefined {
+function getChildTaskBrief(ctx: ExtensionContext): string | undefined {
 	try {
-		const branch = ctx.sessionManager?.getBranch?.() ?? [];
+		const branch = ctx.sessionManager.getBranch() ?? [];
 		for (const entry of branch) {
 			if (entry?.type !== "message" || entry.message?.role !== "user") continue;
 			const text = extractTextContent(entry.message.content).trim();
@@ -393,13 +479,13 @@ function matchOptionAnswer(decision: string, options: AskOption[]): AskAnswer | 
 }
 
 /** One independent completion using the given context's model/state. */
-async function runDecider(ctx: any, request: MainAgentDecisionRequest): Promise<string> {
-	const model = ctx.model ?? ctx.modelRegistry?.getAll?.()[0];
+async function runDecider(ctx: ExtensionContext, request: MainAgentDecisionRequest): Promise<string> {
+	const model = ctx.model ?? ctx.modelRegistry.getAvailable()[0] ?? ctx.modelRegistry.getAll()[0];
 	if (!model) throw new Error("no model available for automatic decision");
 
 	let systemPrompt = "";
 	try {
-		systemPrompt = ctx.getSystemPrompt?.() ?? "";
+		systemPrompt = ctx.getSystemPrompt();
 	} catch {
 		systemPrompt = "";
 	}
@@ -460,7 +546,7 @@ function buildAutoDecidedResult(
 }
 
 async function askSingleChoice(
-	ctx: any,
+	ctx: ExtensionContext,
 	question: string,
 	context: string | undefined,
 	options: AskOption[],
@@ -593,7 +679,7 @@ async function askSingleChoice(
 }
 
 async function askMultiChoice(
-	ctx: any,
+	ctx: ExtensionContext,
 	question: string,
 	context: string | undefined,
 	options: AskOption[],
@@ -829,9 +915,10 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	let autoDecisionCount = 0;
 
 	// Only a root session (not spawned as a subagent) serves decisions. Persisted
-	// children carry `parentSession`; in-memory children only carry the
-	// `<type>#<agentId>` session name. See isSubagentSession().
+	// and in-process children carry `parentSession`; spawned children set
+	// PI_SUBAGENT_CHILD. See isSubagentSession().
 	pi.on("session_start", (_event, ctx) => {
+		autoDecisionCount = 0;
 		if (isSubagentSession(ctx)) return;
 		let sessionId: string | undefined;
 		try {
@@ -839,6 +926,16 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		} catch {
 			sessionId = undefined;
 		}
+
+		// Non-interactive sessions (a subagent in print/JSON mode) publish only
+		// when no other live session already serves decisions. A TUI/RPC root
+		// always replaces the previous decider, because session switches and
+		// reloads can start the replacement before the old shutdown fires.
+		const existing = getMainAgentDecider();
+		if (existing && ctx.mode !== "tui" && ctx.mode !== "rpc" && existing.sessionId !== sessionId) {
+			return;
+		}
+
 		const decider: MainAgentDecider = {
 			token: activationToken,
 			sessionId,
@@ -869,6 +966,9 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			"Ask the user a single question and pause execution until they answer. Use this when requirements are ambiguous, user preferences are needed, a decision would materially affect implementation, or you need confirmation before proceeding. Ask exactly one question per tool call, and prefer multiple separate tool calls over bundling unrelated questions together. If no human is available (subagent or headless session), the question is automatically routed to the main agent, which decides for you and returns that decision — treat it as final.",
 		promptSnippet:
 			"Use this tool to ask exactly one clarifying question, missing-requirement question, preference question, or decision question before continuing.",
+		// Asking the user must only happen through a model-issued call; codemode
+		// scripts and other tools cannot wait on a human.
+		exposure: "model-only",
 		promptGuidelines: [
 			"Ask exactly one question per tool call.",
 			"If you need answers to multiple questions, make multiple separate ask_user_question tool calls instead of combining them into one prompt.",
@@ -953,6 +1053,11 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 				}
 
 				if (mode === "single-select") {
+					// `ctx.ui.custom()` only renders in TUI mode; RPC and other embedded
+					// clients support select/input dialogs instead.
+					if (ctx.mode !== "tui") {
+						return askWithDialogs(ctx, params.question, context, options, mode);
+					}
 					const answer = await askSingleChoice(ctx, params.question, context, options);
 					if (!answer) {
 						return cancelledResult(params.question, mode, context);
@@ -960,6 +1065,9 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 					return buildResult(params.question, context, mode, [answer]);
 				}
 
+				if (ctx.mode !== "tui") {
+					return askWithDialogs(ctx, params.question, context, options, mode);
+				}
 				const answers = await askMultiChoice(ctx, params.question, context, options);
 				if (!answers) {
 					return cancelledResult(params.question, mode, context);
